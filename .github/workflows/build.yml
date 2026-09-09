@@ -1,0 +1,114 @@
+name: Build Luma Visuals JAR
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Find Gradle project directory
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(find . -name settings.gradle -o -name settings.gradle.kts \
+            | grep -v '/build/' \
+            | sed 's|/settings.gradle.*$||' \
+            | sed 's|^\./||' \
+            | awk '{ print length" "$0 }' | sort -n | head -n 1 | cut -d' ' -f2-)"
+          if [ -z "$dir" ]; then dir="."; fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "Gradle project: $dir"
+          ls -la "$dir"
+
+      - name: Set up Gradle 8.12
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.12'
+          build-scan-publish: false
+
+      - name: Build mod (Fabric Loom)
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --stacktrace --console=plain build
+
+      - name: List produced JARs
+        if: always()
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          echo '--- build/libs ---'
+          ls -la build/libs || echo 'build/libs is missing'
+
+      - name: Collect release JAR
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/artifact"
+          found=0
+          for f in build/libs/*.jar; do
+            case "$f" in
+              *-sources.jar|*-dev.jar|*-dev-shadow.jar|*-sources-dev.jar) continue ;;
+            esac
+            cp "$f" "$RUNNER_TEMP/artifact/"
+            found=1
+          done
+          if [ "$found" -eq 0 ]; then
+            echo 'No release JAR found in build/libs' >&2
+            exit 1
+          fi
+          cd "$RUNNER_TEMP/artifact"
+          sha256sum *.jar > SHA256SUMS.txt
+          {
+            echo '### Build succeeded'
+            echo ''
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LumaVisuals-MC1.21.4-${{ github.run_number }}
+          path: ${{ runner.temp }}/artifact/*
+          if-no-files-found: error
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            ${{ steps.project.outputs.dir }}/build/reports/**
+            ${{ steps.project.outputs.dir }}/build/tmp/**
+          if-no-files-found: ignore
