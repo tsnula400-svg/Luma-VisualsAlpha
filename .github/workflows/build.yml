@@ -1,114 +1,103 @@
-name: Build Luma Visuals JAR
+name: Build Lume Visuals - Audited Sources
 
 on:
   workflow_dispatch:
+  # Build checked-out sources on every push, not only selected paths.
   push:
   pull_request:
 
 permissions:
   contents: read
 
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    timeout-minutes: 45
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          clean: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Find Gradle project directory
-        id: project
-        shell: bash
-        run: |
-          set -euo pipefail
-          dir="$(find . -name settings.gradle -o -name settings.gradle.kts \
-            | grep -v '/build/' \
-            | sed 's|/settings.gradle.*$||' \
-            | sed 's|^\./||' \
-            | awk '{ print length" "$0 }' | sort -n | head -n 1 | cut -d' ' -f2-)"
-          if [ -z "$dir" ]; then dir="."; fi
-          echo "dir=$dir" >> "$GITHUB_OUTPUT"
-          echo "Gradle project: $dir"
-          ls -la "$dir"
-
-      - name: Set up Gradle 8.12
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.12'
-          build-scan-publish: false
 
-      - name: Build mod (Fabric Loom)
-        working-directory: ${{ steps.project.outputs.dir }}
+      - name: Select checked-out project (never a ZIP)
         shell: bash
         run: |
           set -euo pipefail
-          gradle --no-daemon --stacktrace --console=plain build
-
-      - name: List produced JARs
-        if: always()
-        working-directory: ${{ steps.project.outputs.dir }}
-        shell: bash
-        run: |
-          echo '--- build/libs ---'
-          ls -la build/libs || echo 'build/libs is missing'
-
-      - name: Collect release JAR
-        working-directory: ${{ steps.project.outputs.dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/artifact"
-          found=0
-          for f in build/libs/*.jar; do
-            case "$f" in
-              *-sources.jar|*-dev.jar|*-dev-shadow.jar|*-sources-dev.jar) continue ;;
-            esac
-            cp "$f" "$RUNNER_TEMP/artifact/"
-            found=1
-          done
-          if [ "$found" -eq 0 ]; then
-            echo 'No release JAR found in build/libs' >&2
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code HEAD
+          # Locate selector only; it rejects multiple projects and stale root workflows.
+          if [[ -f "$GITHUB_WORKSPACE/tools/select_project.py" ]]; then
+            selector="$GITHUB_WORKSPACE/tools/select_project.py"
+          elif [[ -f "$GITHUB_WORKSPACE/LumaVisuals/tools/select_project.py" ]]; then
+            selector="$GITHUB_WORKSPACE/LumaVisuals/tools/select_project.py"
+          else
+            echo 'Extract audited sources into root or LumaVisuals/ and replace root build.yml.' >&2
             exit 1
           fi
-          cd "$RUNNER_TEMP/artifact"
-          sha256sum *.jar > SHA256SUMS.txt
-          {
-            echo '### Build succeeded'
-            echo ''
-            echo '```'
-            cat SHA256SUMS.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          project="$(python3 "$selector" "$GITHUB_WORKSPACE")"
+          echo "LUMA_PROJECT=$project" >> "$GITHUB_ENV"
+          echo "Commit: $GITHUB_SHA"
+          echo "Source: $project (checked-out files; all ZIPs ignored)"
 
-      - name: Upload JAR artifact
-        uses: actions/upload-artifact@v4
+      - name: Source, interaction and build-guard regressions (not Minecraft)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$LUMA_PROJECT"
+          python3 tools/test_build_guards.py
+          python3 tools/test_javap_normalization.py
+          bash tools/check_core.sh "$RUNNER_TEMP/luma-core" 2>&1 | tee "$RUNNER_TEMP/luma-core.log"
+          python3 tools/custom_skin_v2/recording_check.py "$RUNNER_TEMP/luma-poses"
+
+      - name: Clean Fabric build and verify exact JAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$LUMA_PROJECT"
+          # Explicitly discard even accidentally checked-in build outputs.
+          rm -rf build
+          gradle --no-daemon --no-build-cache --rerun-tasks clean build --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/luma-build.log"
+          version="$(sed -n 's/^mod_version=//p' gradle.properties | tr -d '\r')"
+          archive_name="$(sed -n 's/^archives_base_name=//p' gradle.properties | tr -d '\r')"
+          test -n "$version"
+          test -n "$archive_name"
+          jar="build/libs/${archive_name}-${version}.jar"
+          test -s "$jar"
+          artifact="$RUNNER_TEMP/luma-artifact"
+          rm -rf "$artifact"
+          mkdir -p "$artifact"
+          python3 tools/verify_jar.py --project . --jar "$jar" --commit "$GITHUB_SHA" --report "$artifact/JAR-VERIFICATION.json"
+          cp "$jar" "$artifact/"
+          cp build/resources/main/luma-build.json "$artifact/SOURCE-IDENTITY.json"
+          cp "$RUNNER_TEMP/luma-core.log" "$RUNNER_TEMP/luma-build.log" "$artifact/"
+          printf 'Minecraft + Zalith Launcher 2 + MobileGlues: NOT RUN\n' > "$artifact/IN-GAME-STATUS.txt"
+          (cd "$artifact" && sha256sum "${archive_name}-${version}.jar" > JAR-SHA256SUMS.txt)
+          echo "### Verified build inputs and package (not in-game)" >> "$GITHUB_STEP_SUMMARY"
+          cat "$artifact/JAR-VERIFICATION.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: LumaVisuals-MC1.21.4-${{ github.run_number }}
-          path: ${{ runner.temp }}/artifact/*
+          name: LumeVisuals-MC1.21.4-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/luma-artifact/*
           if-no-files-found: error
+          overwrite: false
 
-      - name: Upload build logs on failure
+      - name: Upload diagnostic logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ github.run_number }}
+          name: LumeVisuals-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ steps.project.outputs.dir }}/build/reports/**
-            ${{ steps.project.outputs.dir }}/build/tmp/**
+            ${{ runner.temp }}/luma-core.log
+            ${{ runner.temp }}/luma-build.log
           if-no-files-found: ignore
