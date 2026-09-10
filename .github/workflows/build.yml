@@ -2,7 +2,6 @@ name: Build Lume Visuals - Audited Sources
 
 on:
   workflow_dispatch:
-  # Build checked-out sources on every push, not only selected paths.
   push:
   pull_request:
 
@@ -25,6 +24,20 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.12'
+
+      - name: Unpack project ZIP (phone workflow, python zipfile - not unzip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          zipfile="$(ls -1 ./*.zip | sort | tail -n1)"
+          echo "Unpacking: $zipfile"
+          python3 -m zipfile -e "$zipfile" LumaVisuals/
+          # Selector requires root build.yml == project build.yml
+          mkdir -p LumaVisuals/.github/workflows
+          cp .github/workflows/build.yml LumaVisuals/.github/workflows/build.yml
 
       - name: Select checked-out project (never a ZIP)
         shell: bash
@@ -32,7 +45,6 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --exit-code HEAD
-          # Locate selector only; it rejects multiple projects and stale root workflows.
           if [[ -f "$GITHUB_WORKSPACE/tools/select_project.py" ]]; then
             selector="$GITHUB_WORKSPACE/tools/select_project.py"
           elif [[ -f "$GITHUB_WORKSPACE/LumaVisuals/tools/select_project.py" ]]; then
@@ -56,20 +68,13 @@ jobs:
           bash tools/check_core.sh "$RUNNER_TEMP/luma-core" 2>&1 | tee "$RUNNER_TEMP/luma-core.log"
           python3 tools/custom_skin_v2/recording_check.py "$RUNNER_TEMP/luma-poses"
 
-      - name: Clean Fabric build via Gradle Wrapper and verify exact JAR
+      - name: Clean Fabric build and verify exact JAR
         shell: bash
         run: |
           set -euo pipefail
           cd "$LUMA_PROJECT"
-          # The wrapper is part of the audited sources: gradle-wrapper.properties pins
-          # Gradle 8.12 and gradlew downloads that exact distribution itself.
-          test -f gradle/wrapper/gradle-wrapper.properties
-          grep -q 'distributionUrl=.*gradle-8\.12-bin\.zip' gradle/wrapper/gradle-wrapper.properties
-          # The exec bit must survive checkout/archives; restore it if it was lost in transit.
-          chmod +x ./gradlew
-          # Explicitly discard even accidentally checked-in build outputs.
           rm -rf build
-          ./gradlew --no-daemon --no-build-cache --rerun-tasks clean build --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/luma-build.log"
+          gradle --no-daemon --no-build-cache --rerun-tasks clean build --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/luma-build.log"
           version="$(sed -n 's/^mod_version=//p' gradle.properties | tr -d '\r')"
           archive_name="$(sed -n 's/^archives_base_name=//p' gradle.properties | tr -d '\r')"
           test -n "$version"
@@ -104,3 +109,4 @@ jobs:
             ${{ runner.temp }}/luma-core.log
             ${{ runner.temp }}/luma-build.log
           if-no-files-found: ignore
+          
