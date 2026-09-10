@@ -11,6 +11,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +36,8 @@ jobs:
 
           ZIP_NAME="luma-visuals-0.1.6-audit.1-nohurtcam-nofire-gradle-wrapper.zip"
 
-          if [[ ! -f "$ZIP_NAME" ]]; then
-            echo "ОШИБКА: в корне репозитория нет файла $ZIP_NAME" >&2
+          if [ ! -f "$ZIP_NAME" ]; then
+            echo "ОШИБКА: нет файла $ZIP_NAME"
             ls -la
             exit 1
           fi
@@ -48,30 +49,32 @@ jobs:
           mkdir -p .luma-src
           python3 -c "import zipfile; zipfile.ZipFile('$ZIP_NAME').extractall('.luma-src')"
 
-          if [[ -f .luma-src/build.gradle ]]; then
-            project="$GITHUB_WORKSPACE/.luma-src"
+          # Ищем build.gradle
+          if [ -f .luma-src/build.gradle ]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE/.luma-src"
           else
-            sub="$(find .luma-src -mindepth 1 -maxdepth 3 -name build.gradle -print -quit)"
-            if [[ -z "$sub" ]]; then
-              echo "ОШИБКА: в архиве не найден build.gradle" >&2
-              find .luma-src -type f | head -30
+            BUILD_GRADLE=$(find .luma-src -name build.gradle | head -1)
+            if [ -z "$BUILD_GRADLE" ]; then
+              echo "ОШИБКА: build.gradle не найден"
+              find .luma-src -type f | head -40
               exit 1
             fi
-            project="\( (cd " \)(dirname "$sub")" && pwd)"
+            PROJECT_DIR=$(dirname "$BUILD_GRADLE")
+            PROJECT_DIR=$(cd "$PROJECT_DIR" && pwd)
           fi
 
-          echo "PROJECT_DIR=$project" >> "$GITHUB_ENV"
-          echo "Project dir: $project"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          echo "Project dir: $PROJECT_DIR"
 
-          test -f "$project/build.gradle"
-          test -f "$project/gradle.properties"
-          test -f "$project/src/main/resources/fabric.mod.json"
+          test -f "$PROJECT_DIR/build.gradle"
+          test -f "$PROJECT_DIR/gradle.properties"
+          test -f "$PROJECT_DIR/src/main/resources/fabric.mod.json"
 
-          # Если в архиве нет gradle-wrapper.jar — скачаем
-          if [[ ! -f "$project/gradle/wrapper/gradle-wrapper.jar" ]]; then
-            echo "gradle-wrapper.jar отсутствует, скачиваю..."
-            mkdir -p "$project/gradle/wrapper"
-            curl -sL -o "$project/gradle/wrapper/gradle-wrapper.jar" \
+          # Если нет wrapper.jar — скачиваем
+          if [ ! -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "Скачиваю gradle-wrapper.jar..."
+            mkdir -p "$PROJECT_DIR/gradle/wrapper"
+            curl -sL -o "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar" \
               "https://raw.githubusercontent.com/gradle/gradle/v8.12.0/gradle/wrapper/gradle-wrapper.jar"
           fi
 
@@ -86,24 +89,23 @@ jobs:
           chmod +x gradlew || true
           rm -rf build
 
-          # Используем wrapper если есть, иначе системный gradle
-          if [[ -f ./gradlew ]]; then
+          if [ -f ./gradlew ]; then
             ./gradlew --no-daemon clean build --stacktrace
           else
             gradle --no-daemon clean build --stacktrace
           fi
 
-          version="$(sed -n 's/^mod_version=//p' gradle.properties | tr -d '\r')"
-          archive_name="$(sed -n 's/^archives_base_name=//p' gradle.properties | tr -d '\r')"
+          version=$(grep '^mod_version=' gradle.properties | cut -d= -f2 | tr -d '\r')
+          archive_name=$(grep '^archives_base_name=' gradle.properties | cut -d= -f2 | tr -d '\r')
           jar="build/libs/\( {archive_name}- \){version}.jar"
 
-          echo "Ожидаемый JAR: $jar"
+          echo "Ищем JAR: $jar"
           ls -la build/libs/ || true
           test -s "$jar"
 
           mkdir -p "$RUNNER_TEMP/luma-artifact"
           cp "$jar" "$RUNNER_TEMP/luma-artifact/"
-          echo "BUILD OK: $(basename "$jar")" >> "$GITHUB_STEP_SUMMARY"
+          echo "BUILD OK: $(basename $jar)" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload JAR
         uses: actions/upload-artifact@v4
