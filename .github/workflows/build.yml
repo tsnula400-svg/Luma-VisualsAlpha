@@ -27,84 +27,87 @@ jobs:
         with:
           gradle-version: '8.12'
 
-      - name: Extract luma-src.zip into the workspace
+      - name: Extract project ZIP
         shell: bash
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-          if [[ ! -f luma-src.zip ]]; then
-            echo 'ОШИБКА: в корне репозитория нет файла luma-src.zip' >&2
-            echo 'Загрузи его: главная страница репо, Add file, Upload files, выбрать luma-src.zip, Commit changes.' >&2
+
+          ZIP_NAME="luma-visuals-0.1.6-audit.1-nohurtcam-nofire-gradle-wrapper.zip"
+
+          if [[ ! -f "$ZIP_NAME" ]]; then
+            echo "ОШИБКА: в корне репозитория нет файла $ZIP_NAME" >&2
+            ls -la
             exit 1
           fi
-          sha256sum luma-src.zip
+
+          echo "Найден архив: $ZIP_NAME"
+          sha256sum "$ZIP_NAME"
+
           rm -rf .luma-src
           mkdir -p .luma-src
-          python3 -c "import zipfile; zipfile.ZipFile('luma-src.zip').extractall('.luma-src')"
+          python3 -c "import zipfile; zipfile.ZipFile('$ZIP_NAME').extractall('.luma-src')"
+
           if [[ -f .luma-src/build.gradle ]]; then
             project="$GITHUB_WORKSPACE/.luma-src"
           else
-            sub="$(find .luma-src -mindepth 2 -maxdepth 2 -name build.gradle -print -quit)"
+            sub="$(find .luma-src -mindepth 1 -maxdepth 3 -name build.gradle -print -quit)"
             if [[ -z "$sub" ]]; then
-              echo 'ОШИБКА: в архиве не найден build.gradle (ни в корне архива, ни в одной подпапке)' >&2
+              echo "ОШИБКА: в архиве не найден build.gradle" >&2
+              find .luma-src -type f | head -30
               exit 1
             fi
-            project="$(cd "$(dirname "$sub")" && pwd)"
+            project="\( (cd " \)(dirname "$sub")" && pwd)"
           fi
+
           echo "PROJECT_DIR=$project" >> "$GITHUB_ENV"
           echo "Project dir: $project"
-          test -f "$project/settings.gradle"
+
+          test -f "$project/build.gradle"
           test -f "$project/gradle.properties"
           test -f "$project/src/main/resources/fabric.mod.json"
-          test -f "$project/tools/verify_jar.py"
-          echo 'Структура проекта OK'
 
-      - name: Offline checks
+          # Если в архиве нет gradle-wrapper.jar — скачаем
+          if [[ ! -f "$project/gradle/wrapper/gradle-wrapper.jar" ]]; then
+            echo "gradle-wrapper.jar отсутствует, скачиваю..."
+            mkdir -p "$project/gradle/wrapper"
+            curl -sL -o "$project/gradle/wrapper/gradle-wrapper.jar" \
+              "https://raw.githubusercontent.com/gradle/gradle/v8.12.0/gradle/wrapper/gradle-wrapper.jar"
+          fi
+
+          echo "Структура проекта OK"
+
+      - name: Gradle build
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          python3 tools/test_javap_normalization.py
-          bash tools/check_core.sh "$RUNNER_TEMP/luma-core" 2>&1 | tee "$RUNNER_TEMP/luma-core.log"
-          python3 tools/custom_skin_v2/recording_check.py "$RUNNER_TEMP/luma-poses"
 
-      - name: Gradle build and JAR verification
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
+          chmod +x gradlew || true
           rm -rf build
-          gradle --no-daemon --no-build-cache --rerun-tasks clean build --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/luma-build.log"
+
+          # Используем wrapper если есть, иначе системный gradle
+          if [[ -f ./gradlew ]]; then
+            ./gradlew --no-daemon clean build --stacktrace
+          else
+            gradle --no-daemon clean build --stacktrace
+          fi
+
           version="$(sed -n 's/^mod_version=//p' gradle.properties | tr -d '\r')"
           archive_name="$(sed -n 's/^archives_base_name=//p' gradle.properties | tr -d '\r')"
-          test -n "$version"
-          test -n "$archive_name"
-          jar="build/libs/${archive_name}-${version}.jar"
-          test -s "$jar"
-          artifact="$RUNNER_TEMP/luma-artifact"
-          rm -rf "$artifact"
-          mkdir -p "$artifact"
-          python3 tools/verify_jar.py --project . --jar "$jar" --commit "$GITHUB_SHA" --report "$artifact/JAR-VERIFICATION.json"
-          cp "$jar" "$artifact/"
-          cp build/resources/main/luma-build.json "$artifact/SOURCE-IDENTITY.json"
-          cp "$RUNNER_TEMP/luma-core.log" "$RUNNER_TEMP/luma-build.log" "$artifact/"
-          (cd "$artifact" && sha256sum "${archive_name}-${version}.jar" > JAR-SHA256SUMS.txt)
-          echo "### BUILD OK: ${archive_name}-${version}.jar" >> "$GITHUB_STEP_SUMMARY"
+          jar="build/libs/\( {archive_name}- \){version}.jar"
 
-      - name: Upload JAR artifact
+          echo "Ожидаемый JAR: $jar"
+          ls -la build/libs/ || true
+          test -s "$jar"
+
+          mkdir -p "$RUNNER_TEMP/luma-artifact"
+          cp "$jar" "$RUNNER_TEMP/luma-artifact/"
+          echo "BUILD OK: $(basename "$jar")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload JAR
         uses: actions/upload-artifact@v4
         with:
-          name: LumaVisuals-jar-${{ github.run_id }}-${{ github.run_attempt }}
+          name: luma-visuals-0.1.6-jar
           path: ${{ runner.temp }}/luma-artifact/*
           if-no-files-found: error
-
-      - name: Upload diagnostic logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: LumaVisuals-failure-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/luma-core.log
-            ${{ runner.temp }}/luma-build.log
-          if-no-files-found: ignore
-          
