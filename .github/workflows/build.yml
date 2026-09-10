@@ -2,6 +2,7 @@ name: Build Lume Visuals - Audited Sources
 
 on:
   workflow_dispatch:
+  # Build checked-out sources on every push, not only selected paths.
   push:
   pull_request:
 
@@ -28,23 +29,23 @@ jobs:
         with:
           gradle-version: '8.12'
 
-      - name: Unpack project ZIP (phone workflow, python zipfile - not unzip)
-        shell: bash
-        run: |
-          set -euo pipefail
-          zipfile="$(ls -1 ./*.zip | sort | tail -n1)"
-          echo "Unpacking: $zipfile"
-          python3 -m zipfile -e "$zipfile" LumaVisuals/
-          # Selector requires root build.yml == project build.yml
-          mkdir -p LumaVisuals/.github/workflows
-          cp .github/workflows/build.yml LumaVisuals/.github/workflows/build.yml
-
-      - name: Select checked-out project (never a ZIP)
+      - name: Pinpoint commit, tree state and Gradle version
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --exit-code HEAD
+          git log -1 --format='BUILD COMMIT: %H%n%s (%ci)'
+          echo '--- git status --porcelain (must be empty) ---'
+          git status --porcelain
+          echo '--- gradle version (must be 8.12; ./gradlew unusable: no wrapper jar in repo) ---'
+          gradle --version
+          gradle --version | grep -q 'Gradle 8.12'
+
+      - name: Select checked-out project (never a ZIP)
+        shell: bash
+        run: |
+          set -euo pipefail
           if [[ -f "$GITHUB_WORKSPACE/tools/select_project.py" ]]; then
             selector="$GITHUB_WORKSPACE/tools/select_project.py"
           elif [[ -f "$GITHUB_WORKSPACE/LumaVisuals/tools/select_project.py" ]]; then
@@ -57,6 +58,34 @@ jobs:
           echo "LUMA_PROJECT=$project" >> "$GITHUB_ENV"
           echo "Commit: $GITHUB_SHA"
           echo "Source: $project (checked-out files; all ZIPs ignored)"
+
+      - name: Feature presence guard (fails RED on stale sources)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$LUMA_PROJECT"
+          # Hard requirement: the user's current features must exist in THIS checkout.
+          grep -Fq 'tiltViewWhenHurt'   src/main/java/dev/luma/client/mixin/GameRendererMixin.java
+          grep -Fq 'luma$noHurtCamera'  src/main/java/dev/luma/client/mixin/GameRendererMixin.java
+          grep -Fq 'renderFireOverlay'  src/main/java/dev/luma/client/mixin/NoFireOverlayMixin.java
+          grep -Fq 'tickMovement'       src/main/java/dev/luma/client/mixin/AutoSprintMixin.java
+          python3 - <<'PY'
+          import json
+          m = json.load(open('src/main/resources/luma.mixins.json'))
+          need = {'AutoSprintMixin', 'NoFireOverlayMixin', 'GameRendererMixin'}
+          missing = need - set(m['client'])
+          assert not missing, f'luma.mixins.json is missing mixins: {missing}'
+          print('Registered mixins OK:', ', '.join(sorted(need)))
+          PY
+          echo '--- feature source hashes (expected for the 2026-09 audit tree) ---'
+          echo 'AutoSprintMixin.java    expected f49c4aa5ef9ae0c8ca9244907927ba17713180e0c43564ab45afbda0f22674fb'
+          echo 'NoFireOverlayMixin.java expected f9cab045ffd6703f15b4bcb3ae3f73f40a2d991ec916f1605ee19f732d1b79f6'
+          echo 'GameRendererMixin.java  expected 82da183c369e6e0195f7538942d836ed7c7419b6e849869cdee6df8aaa929361'
+          echo '--- actual ---'
+          sha256sum src/main/java/dev/luma/client/mixin/AutoSprintMixin.java \
+                    src/main/java/dev/luma/client/mixin/NoFireOverlayMixin.java \
+                    src/main/java/dev/luma/client/mixin/GameRendererMixin.java \
+                    src/main/resources/luma.mixins.json | tee "$RUNNER_TEMP/feature-hashes.txt"
 
       - name: Source, interaction and build-guard regressions (not Minecraft)
         shell: bash
@@ -73,6 +102,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$LUMA_PROJECT"
+          # Explicitly discard even accidentally checked-in build outputs.
           rm -rf build
           gradle --no-daemon --no-build-cache --rerun-tasks clean build --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/luma-build.log"
           version="$(sed -n 's/^mod_version=//p' gradle.properties | tr -d '\r')"
@@ -81,17 +111,32 @@ jobs:
           test -n "$archive_name"
           jar="build/libs/${archive_name}-${version}.jar"
           test -s "$jar"
+          echo '--- build/libs content (name, size, timestamp) BEFORE packaging ---'
+          ls -la --time-style=full-iso build/libs
+          echo '--- SHA256 of every file in build/libs ---'
+          sha256sum build/libs/*
+          short="${GITHUB_SHA::8}"
+          stamped="${archive_name}-${version}-${short}.jar"
           artifact="$RUNNER_TEMP/luma-artifact"
           rm -rf "$artifact"
           mkdir -p "$artifact"
           python3 tools/verify_jar.py --project . --jar "$jar" --commit "$GITHUB_SHA" --report "$artifact/JAR-VERIFICATION.json"
-          cp "$jar" "$artifact/"
+          # Ship the JAR under a commit-stamped name so builds can never be confused.
+          cp "$jar" "$artifact/$stamped"
           cp build/resources/main/luma-build.json "$artifact/SOURCE-IDENTITY.json"
           cp "$RUNNER_TEMP/luma-core.log" "$RUNNER_TEMP/luma-build.log" "$artifact/"
+          cp "$RUNNER_TEMP/feature-hashes.txt" "$artifact/FEATURE-SOURCES-SHA256.txt"
           printf 'Minecraft + Zalith Launcher 2 + MobileGlues: NOT RUN\n' > "$artifact/IN-GAME-STATUS.txt"
-          (cd "$artifact" && sha256sum "${archive_name}-${version}.jar" > JAR-SHA256SUMS.txt)
-          echo "### Verified build inputs and package (not in-game)" >> "$GITHUB_STEP_SUMMARY"
-          cat "$artifact/JAR-VERIFICATION.json" >> "$GITHUB_STEP_SUMMARY"
+          (cd "$artifact" && sha256sum "$stamped" | tee JAR-SHA256SUMS.txt)
+          {
+            echo '### Build identity'
+            echo "- commit: \`$GITHUB_SHA\`"
+            echo "- shipped JAR: \`$stamped\`"
+            echo '- SHA256:'
+            cat "$artifact/JAR-SHA256SUMS.txt"
+            echo '### Verified build inputs and package (not in-game)'
+            cat "$artifact/JAR-VERIFICATION.json"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -109,4 +154,3 @@ jobs:
             ${{ runner.temp }}/luma-core.log
             ${{ runner.temp }}/luma-build.log
           if-no-files-found: ignore
-          
