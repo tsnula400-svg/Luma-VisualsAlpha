@@ -1,0 +1,59 @@
+name: Import sources (one-time bootstrap)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wipe old content, keep only .github and .git
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 -not -name .git -not -name .github -exec rm -rf {} +
+          echo '--- after cleanup ---'
+          ls -la
+
+      - name: Unpack the uploaded sources ZIP into repo root
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t zips < <(ls *.zip 2>/dev/null)
+          test "${#zips[@]}" -eq 1 || { echo "Expected exactly one ZIP at root, found: ${#zips[@]}" >&2; exit 1; }
+          unzip -o "${zips[0]}" -x '.github/*' -d .
+          rm -f "${zips[0]}"
+
+      - name: Sanity check: audited project must be complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build.gradle
+          test -f settings.gradle
+          test -f gradle.properties
+          test -f src/main/resources/fabric.mod.json
+          test -f tools/verify_jar.py
+          test -f tools/select_project.py
+          test -d preview/src
+          # Selector must accept exactly one project at root:
+          python3 tools/select_project.py .
+          # New build.yml must still be in place (not overwritten by the ZIP):
+          grep -q 'Feature presence guard' .github/workflows/build.yml
+          echo '--- imported tree (top level) ---'
+          ls -la
+
+      - name: Commit and push imported sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Import audited Luma Visuals sources" || echo "nothing to commit"
+          git push
